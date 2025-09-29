@@ -1,0 +1,104 @@
+name: ConoHa Debug (Auth & Status)
+
+on:
+    workflow_dispatch: {}
+
+jobs:
+    debug:
+        runs-on: ubuntu-latest
+        env:
+            ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens
+            COMPUTE_BASE: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }}/${{ secrets.CONOHA_TENANT_ID }}
+            TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
+            SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
+        steps:
+            - name: Install jq
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq
+
+            - name: Get ConoHa Token (v3, robust / no-heredoc)
+              id: auth
+              env:
+                  USERNAME: ${{ secrets.CONOHA_USERNAME }}
+                  PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  # name で試行
+                  PAYLOAD1="$(jq -n \
+                    --arg user "$USERNAME" \
+                    --arg pass "$PASSWORD" \
+                    --arg tenant "$TENANT_ID" \
+                    '{
+                      auth:{
+                        identity:{
+                          methods:["password"],
+                          password:{user:{name:$user,domain:{name:"default"},password:$pass}}
+                        },
+                        scope:{project:{id:$tenant}}
+                      }
+                    }')"
+
+                  H="$(mktemp)"; B="$(mktemp)"
+                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD1" "$ID_V3"
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
+
+                  # ダメなら id で再試行
+                  if [ -z "${TOKEN:-}" ]; then
+                    PAYLOAD2="$(jq -n \
+                      --arg user "$USERNAME" \
+                      --arg pass "$PASSWORD" \
+                      --arg tenant "$TENANT_ID" \
+                      '{
+                        auth:{
+                          identity:{
+                            methods:["password"],
+                            password:{user:{id:$user,domain:{name:"default"},password:$pass}}
+                          },
+                          scope:{project:{id:$tenant}}
+                        }
+                      }')"
+                    : >"$H"; : >"$B"
+                    curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD2" "$ID_V3"
+                    TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
+                  fi
+
+                  if [ -z "${TOKEN:-}" ]; then
+                    echo "::error::Failed to get v3 token"
+                    echo "---- Response Headers ----"; cat "$H"
+                    echo "---- Response Body ----"; cat "$B"
+                    exit 1
+                  fi
+
+                  echo "Got token (first 10 chars): ${TOKEN:0:10}********"
+                  printf 'token=%s\n' "$TOKEN" >> "$GITHUB_OUTPUT"
+
+            - name: Get server status
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" \
+                    | jq -r '.server.status' | sed 's/^/Status: /'
+
+            # ▼起動・停止したいときは下をコメント解除
+            # - name: Power ON (os-start)
+            #   env:
+            #     TOKEN: ${{ steps.auth.outputs.token }}
+            #   run: |
+            #     curl -sS -X POST \
+            #       -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
+            #       -d '{"os-start": null}' \
+            #       "${COMPUTE_BASE}/servers/${SERVER_ID}/action"
+            #
+            # - name: Power OFF (os-stop)
+            #   env:
+            #     TOKEN: ${{ steps.auth.outputs.token }}
+            #   run: |
+            #     curl -sS -X POST \
+            #       -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
+            #       -d '{"os-stop": null}' \
+            #       "${COMPUTE_BASE}/servers/${SERVER_ID}/action"
