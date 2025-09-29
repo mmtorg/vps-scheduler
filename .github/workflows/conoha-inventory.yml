@@ -1,9 +1,9 @@
-name: ConoHa VPS - Inventory (JSON)
+name: ConoHa - Inventory (JSON)
 
 on:
     workflow_dispatch: {}
     schedule:
-        - cron: "5 16 * * *" # 22:35 MMT に毎日
+        - cron: "5 16 * * *" # 22:35 MMT
 
 jobs:
     inventory:
@@ -15,7 +15,7 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install -y jq
 
-            - name: Get token & discover endpoints (Keystone v3)
+            - name: Auth & endpoint discovery (Keystone v3)
               id: auth
               env:
                   ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens
@@ -28,43 +28,47 @@ jobs:
                   set -euo pipefail
 
                   build_payload() {
-                    local key="$1" val="$2"
-                    jq -n --arg u "$val" --arg p "$PASSWORD" --arg t "$TENANT_ID" '
-                    { auth:{
-                        identity:{ methods:["password"],
-                          password:{ user:{(env.key):$u, domain:{name:"default"}, password:$p} } },
-                        scope:{ project:{ id:$t } }
-                    }}'
+                    local key="$1" userval="$2"
+                    jq -n \
+                      --arg u "$userval" \
+                      --arg p "$PASSWORD" \
+                      --arg t "$TENANT_ID" \
+                      --arg key "$key" \
+                      '{
+                        auth:{
+                          identity:{
+                            methods:["password"],
+                            password:{ user:{($key):$u, domain:{name:"default"}, password:$p} }
+                          },
+                          scope:{ project:{ id:$t } }
+                        }
+                      }'
                   }
 
                   # try with user.name then user.id
                   H=$(mktemp); B=$(mktemp)
-                  key=name
-                  P="$(KEY="$key" build_payload)"
+                  P="$(build_payload name "$USERNAME")"
                   curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3" || true
                   TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
                   if [ -z "${TOKEN:-}" ]; then
                     : >"$H"; : >"$B"
-                    key=id
-                    P="$(KEY="$key" build_payload)"
+                    P="$(build_payload id "$USERNAME")"
                     curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3"
                     TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
                   fi
-                  test -n "${TOKEN:-}" || { echo "::error::Failed to get token"; exit 1; }
+                  test -n "${TOKEN:-}" || { echo "::error::Failed to get v3 token"; exit 1; }
 
-                  # extract endpoints from catalog
                   to_map() {
                     jq -r --arg t "$1" '
                       .token.catalog[] | select(.type==$t) |
-                      .endpoints[] | select(.interface=="public") | .url' "$B"
+                      .endpoints[] | select(.interface=="public") | .url' "$B" | sed 's:/*$::'
                   }
 
-                  COMPUTE_CANDS="$(to_map compute | sed 's:/*$::')"
-                  IMAGE_CANDS="$(to_map image   | sed 's:/*$::')"
-                  NETWORK_CANDS="$(to_map network | sed 's:/*$::')"
-                  VOLUME_CANDS="$(to_map volumev3 | sed 's:/*$::')"
+                  COMPUTE_CANDS="$(to_map compute || true)"
+                  IMAGE_CANDS="$(to_map image   || true)"
+                  NETWORK_CANDS="$(to_map network || true)"
+                  VOLUME_CANDS="$(to_map volumev3 || true)"
 
-                  # choose working compute base (add fallback + /TENANT fix)
                   mapfile -t compute_try < <(
                     {
                       printf '%s\n' "$COMPUTE_CANDS"
@@ -84,9 +88,8 @@ jobs:
                       fi
                     done
                   done
-                  test -n "$CHOSEN_COMPUTE" || { echo "::error::No working compute endpoint"; exit 1; }
+                  test -n "$CHOSEN_COMPUTE" || { echo "::error::No working compute endpoint found"; exit 1; }
 
-                  # choose first public endpoints for others (no strict validation)
                   CHOSEN_IMAGE="$(printf '%s\n' "$IMAGE_CANDS"   | head -n1 | sed 's:/*$::')"
                   CHOSEN_NETWORK="$(printf '%s\n' "$NETWORK_CANDS" | head -n1 | sed 's:/*$::')"
                   CHOSEN_VOLUME="$(printf '%s\n' "$VOLUME_CANDS" | head -n1 | sed 's:/*$::')"
@@ -99,7 +102,7 @@ jobs:
                     echo "volume_base=$CHOSEN_VOLUME"
                   } >> "$GITHUB_OUTPUT"
 
-            - name: Fetch resources and build inventory.json
+            - name: Fetch & build inventory.json
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
                   COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
@@ -112,20 +115,18 @@ jobs:
                   set -euo pipefail
                   mkdir -p out
 
-                  # --- Collect raw ---
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/servers/detail" > out/servers.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/flavors/detail" > out/flavors.json || echo '{"flavors":[]}' > out/flavors.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${IMAGE_BASE%/}/images" > out/images.json || echo '{"images":[]}' > out/images.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/networks" > out/networks.json || echo '{"networks":[]}' > out/networks.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/subnets" > out/subnets.json || echo '{"subnets":[]}' > out/subnets.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/ports" > out/ports.json || echo '{"ports":[]}' > out/ports.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/floatingips" > out/fips.json || echo '{"floatingips":[]}' > out/fips.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/servers/detail"       > out/servers.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/flavors/detail"       > out/flavors.json || echo '{"flavors":[]}' > out/flavors.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${IMAGE_BASE%/}/images"                 > out/images.json  || echo '{"images":[]}'  > out/images.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/networks"       > out/networks.json || echo '{"networks":[]}' > out/networks.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/subnets"        > out/subnets.json || echo '{"subnets":[]}' > out/subnets.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/ports"          > out/ports.json   || echo '{"ports":[]}'   > out/ports.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/floatingips"    > out/fips.json    || echo '{"floatingips":[]}' > out/fips.json
                   curl -sS -H "X-Auth-Token: ${TOKEN}" "${VOLUME_BASE%/}/${TENANT_ID}/volumes/detail" > out/volumes.json || echo '{"volumes":[]}' > out/volumes.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/os-keypairs" > out/keypairs.json || echo '{"keypairs":[]}' > out/keypairs.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/limits" > out/limits.json || echo '{}' > out/limits.json
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/os-security-groups" > out/secgroups.json || echo '{"security_groups":[]}' > out/secgroups.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/os-keypairs"         > out/keypairs.json || echo '{"keypairs":[]}' > out/keypairs.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/limits"              > out/limits.json || echo '{}' > out/limits.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/os-security-groups"  > out/secgroups.json || echo '{"security_groups":[]}' > out/secgroups.json
 
-                  # --- Compact inventory (human-friendly but JSON) ---
                   jq -n \
                     --slurpfile servers   out/servers.json \
                     --slurpfile flavors   out/flavors.json \
@@ -166,12 +167,11 @@ jobs:
                       security_groups: ($secgroups[0].security_groups // []) | map({id, name, description, rules: .rules})
                     }' > inventory.json
 
-                  echo "Inventory saved: $(pwd)/inventory.json"
-                  echo "::group::Inventory preview"
-                  jq '.servers | length as $n | {server_count:$n} + {first_server:(.[]|select(.name)|.name)?}' inventory.json
+                  echo "::group::Preview"
+                  jq '.servers | length as $n | {server_count:$n, sample:(.[0]?.name)}' inventory.json
                   echo "::endgroup::"
 
-            - name: Upload artifact (inventory.json)
+            - name: Upload artifact
               uses: actions/upload-artifact@v4
               with:
                   name: conoha-inventory
