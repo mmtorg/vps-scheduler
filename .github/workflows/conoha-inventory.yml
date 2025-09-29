@@ -1,0 +1,179 @@
+name: ConoHa VPS - Inventory (JSON)
+
+on:
+    workflow_dispatch: {}
+    schedule:
+        - cron: "5 16 * * *" # 22:35 MMT に毎日
+
+jobs:
+    inventory:
+        runs-on: ubuntu-latest
+
+        steps:
+            - name: Install tools
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq
+
+            - name: Get token & discover endpoints (Keystone v3)
+              id: auth
+              env:
+                  ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens
+                  USERNAME: ${{ secrets.CONOHA_USERNAME }}
+                  PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
+                  TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
+                  FALLBACK_COMPUTE: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+
+                  build_payload() {
+                    local key="$1" val="$2"
+                    jq -n --arg u "$val" --arg p "$PASSWORD" --arg t "$TENANT_ID" '
+                    { auth:{
+                        identity:{ methods:["password"],
+                          password:{ user:{(env.key):$u, domain:{name:"default"}, password:$p} } },
+                        scope:{ project:{ id:$t } }
+                    }}'
+                  }
+
+                  # try with user.name then user.id
+                  H=$(mktemp); B=$(mktemp)
+                  key=name
+                  P="$(KEY="$key" build_payload)"
+                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3" || true
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
+                  if [ -z "${TOKEN:-}" ]; then
+                    : >"$H"; : >"$B"
+                    key=id
+                    P="$(KEY="$key" build_payload)"
+                    curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3"
+                    TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
+                  fi
+                  test -n "${TOKEN:-}" || { echo "::error::Failed to get token"; exit 1; }
+
+                  # extract endpoints from catalog
+                  to_map() {
+                    jq -r --arg t "$1" '
+                      .token.catalog[] | select(.type==$t) |
+                      .endpoints[] | select(.interface=="public") | .url' "$B"
+                  }
+
+                  COMPUTE_CANDS="$(to_map compute | sed 's:/*$::')"
+                  IMAGE_CANDS="$(to_map image   | sed 's:/*$::')"
+                  NETWORK_CANDS="$(to_map network | sed 's:/*$::')"
+                  VOLUME_CANDS="$(to_map volumev3 | sed 's:/*$::')"
+
+                  # choose working compute base (add fallback + /TENANT fix)
+                  mapfile -t compute_try < <(
+                    {
+                      printf '%s\n' "$COMPUTE_CANDS"
+                      [ -n "${FALLBACK_COMPUTE:-}" ] && printf '%s\n' "${FALLBACK_COMPUTE%/}"
+                    } | awk 'NF' | sort -u
+                  )
+
+                  CHOSEN_COMPUTE=""
+                  for base in "${compute_try[@]}"; do
+                    TESTS=("$base")
+                    [[ "$base" =~ /v2(\.1)?$ ]] && TESTS+=("${base}/${TENANT_ID}")
+                    for cb in "${TESTS[@]}"; do
+                      CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "X-Auth-Token: ${TOKEN}" "${cb%/}/servers/detail" || echo 000)"
+                      if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+                        CHOSEN_COMPUTE="${cb%/}"
+                        break 2
+                      fi
+                    done
+                  done
+                  test -n "$CHOSEN_COMPUTE" || { echo "::error::No working compute endpoint"; exit 1; }
+
+                  # choose first public endpoints for others (no strict validation)
+                  CHOSEN_IMAGE="$(printf '%s\n' "$IMAGE_CANDS"   | head -n1 | sed 's:/*$::')"
+                  CHOSEN_NETWORK="$(printf '%s\n' "$NETWORK_CANDS" | head -n1 | sed 's:/*$::')"
+                  CHOSEN_VOLUME="$(printf '%s\n' "$VOLUME_CANDS" | head -n1 | sed 's:/*$::')"
+
+                  {
+                    echo "token=$TOKEN"
+                    echo "compute_base=$CHOSEN_COMPUTE"
+                    echo "image_base=$CHOSEN_IMAGE"
+                    echo "network_base=$CHOSEN_NETWORK"
+                    echo "volume_base=$CHOSEN_VOLUME"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Fetch resources and build inventory.json
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+                  COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
+                  IMAGE_BASE: ${{ steps.auth.outputs.image_base }}
+                  NETWORK_BASE: ${{ steps.auth.outputs.network_base }}
+                  VOLUME_BASE: ${{ steps.auth.outputs.volume_base }}
+                  TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p out
+
+                  # --- Collect raw ---
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/servers/detail" > out/servers.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/flavors/detail" > out/flavors.json || echo '{"flavors":[]}' > out/flavors.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${IMAGE_BASE%/}/images" > out/images.json || echo '{"images":[]}' > out/images.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/networks" > out/networks.json || echo '{"networks":[]}' > out/networks.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/subnets" > out/subnets.json || echo '{"subnets":[]}' > out/subnets.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/ports" > out/ports.json || echo '{"ports":[]}' > out/ports.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${NETWORK_BASE%/}/v2.0/floatingips" > out/fips.json || echo '{"floatingips":[]}' > out/fips.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${VOLUME_BASE%/}/${TENANT_ID}/volumes/detail" > out/volumes.json || echo '{"volumes":[]}' > out/volumes.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/os-keypairs" > out/keypairs.json || echo '{"keypairs":[]}' > out/keypairs.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/limits" > out/limits.json || echo '{}' > out/limits.json
+                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/os-security-groups" > out/secgroups.json || echo '{"security_groups":[]}' > out/secgroups.json
+
+                  # --- Compact inventory (human-friendly but JSON) ---
+                  jq -n \
+                    --slurpfile servers   out/servers.json \
+                    --slurpfile flavors   out/flavors.json \
+                    --slurpfile images    out/images.json \
+                    --slurpfile nets      out/networks.json \
+                    --slurpfile subnets   out/subnets.json \
+                    --slurpfile ports     out/ports.json \
+                    --slurpfile fips      out/fips.json \
+                    --slurpfile vols      out/volumes.json \
+                    --slurpfile keys      out/keypairs.json \
+                    --slurpfile limits    out/limits.json \
+                    --slurpfile secgroups out/secgroups.json \
+                    --arg compute "${COMPUTE_BASE%/}" \
+                    --arg image   "${IMAGE_BASE%/}" \
+                    --arg network "${NETWORK_BASE%/}" \
+                    --arg volume  "${VOLUME_BASE%/}" \
+                    '{
+                      fetched_at: now|toiso8601,
+                      endpoints: { compute:$compute, image:$image, network:$network, volume:$volume },
+                      servers: ($servers[0].servers // []) | map({
+                        id, name, status, created, updated,
+                        hostId,
+                        flavor_id: (.flavor.id // .flavorRef // null),
+                        image_id:  (.image.id  // .imageRef  // null),
+                        key_name,
+                        addresses,
+                        security_groups: (.security_groups // [] | map(.name))
+                      }),
+                      flavors: ($flavors[0].flavors // []) | map({id, name, ram, vcpus, disk}),
+                      images:  ($images[0].images  // []) | map({id, name, status, created_at, updated_at, minDisk, minRam, size}),
+                      networks: ($nets[0].networks // []) | map({id, name, router: .router:external?, shared, status, subnets}),
+                      subnets:  ($subnets[0].subnets // []) | map({id, name, network_id, cidr, gateway_ip, ip_version}),
+                      ports:    ($ports[0].ports    // []) | map({id, name, network_id, device_id, mac_address, fixed_ips}),
+                      floatingips: ($fips[0].floatingips // []) | map({id, floating_ip_address, fixed_ip_address, port_id, status}),
+                      volumes:  ($vols[0].volumes  // []) | map({id, name, size, status, attachments, created_at}),
+                      keypairs: ($keys[0].keypairs // []) | map(.keypair|{name, public_key, fingerprint}),
+                      limits:   $limits[0],
+                      security_groups: ($secgroups[0].security_groups // []) | map({id, name, description, rules: .rules})
+                    }' > inventory.json
+
+                  echo "Inventory saved: $(pwd)/inventory.json"
+                  echo "::group::Inventory preview"
+                  jq '.servers | length as $n | {server_count:$n} + {first_server:(.[]|select(.name)|.name)?}' inventory.json
+                  echo "::endgroup::"
+
+            - name: Upload artifact (inventory.json)
+              uses: actions/upload-artifact@v4
+              with:
+                  name: conoha-inventory
+                  path: inventory.json
+                  retention-days: 7
