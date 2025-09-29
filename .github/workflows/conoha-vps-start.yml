@@ -2,15 +2,15 @@ name: ConoHa VPS - Start (22:30 MMT)
 
 on:
     schedule:
-        # 16:00 UTC 毎日＝MMT(UTC+6:30) で 22:30
-        - cron: "0 16 * * *"
+        - cron: "0 16 * * *" # 22:30 MMT
     workflow_dispatch: {}
 
 jobs:
     start:
         runs-on: ubuntu-latest
         env:
-            CONOHA_REGION: ${{ secrets.CONOHA_REGION || 'tyo1' }}
+            ID_ENDPOINT: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/v2.0/tokens
+            COMPUTE_BASE: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }}/${{ secrets.CONOHA_TENANT_ID }}
             TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
             SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
         steps:
@@ -20,7 +20,6 @@ jobs:
             - name: Get ConoHa Token
               id: auth
               run: |
-                  ID_ENDPOINT="https://identity.${CONOHA_REGION}.conoha.io/v2.0/tokens"
                   PAYLOAD=$(cat <<'JSON'
                   {
                     "auth": {
@@ -47,15 +46,15 @@ jobs:
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
               run: |
-                  COMPUTE="https://compute.${CONOHA_REGION}.conoha.io/v2/${TENANT_ID}/servers/${SERVER_ID}/action"
-                  curl -fsS -X POST -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
-                    -d '{"os-start": null}' "${COMPUTE}"
+                  curl -fsS -X POST \
+                    -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
+                    -d '{"os-start": null}' \
+                    "${COMPUTE_BASE}/servers/${SERVER_ID}/action"
 
             - name: Wait until ACTIVE (optional)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
               run: |
-                  COMPUTE_BASE="https://compute.${CONOHA_REGION}.conoha.io/v2/${TENANT_ID}"
                   for i in $(seq 1 30); do
                     STATUS=$(curl -fsS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" | jq -r '.server.status')
                     echo "Current status: $STATUS"
@@ -68,6 +67,5 @@ jobs:
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
               run: |
-                  COMPUTE_BASE="https://compute.${CONOHA_REGION}.conoha.io/v2/${TENANT_ID}"
                   curl -fsS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" \
                     | jq -r '.server.addresses | to_entries[] | "\(.key): " + ( .value | map(.addr) | join(", ") )'
