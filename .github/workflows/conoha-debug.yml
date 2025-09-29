@@ -17,63 +17,73 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install -y jq
 
-            - name: Get ConoHa Token (v3, robust / no-heredoc)
+            - name: Get ConoHa Token (v3, read service catalog)
               id: auth
+              shell: bash
               env:
+                  ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens # https://identity.c3j1.conoha.io/v3/auth/tokens
                   USERNAME: ${{ secrets.CONOHA_USERNAME }}
                   PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
-              shell: bash
+                  TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
               run: |
                   set -euo pipefail
 
-                  # name で試行
-                  PAYLOAD1="$(jq -n \
-                    --arg user "$USERNAME" \
-                    --arg pass "$PASSWORD" \
-                    --arg tenant "$TENANT_ID" \
-                    '{
+                  # リクエスト組み立て（user.name→ダメなら user.id でも再試行）
+                  build_payload() {
+                  local key="$1" val="$2"
+                  jq -n --arg user "$val" --arg pass "$PASSWORD" --arg tenant "$TENANT_ID" '
+                      {
                       auth:{
-                        identity:{
-                          methods:["password"],
-                          password:{user:{name:$user,domain:{name:"default"},password:$pass}}
-                        },
-                        scope:{project:{id:$tenant}}
-                      }
-                    }')"
-
-                  H="$(mktemp)"; B="$(mktemp)"
-                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD1" "$ID_V3"
-                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
-
-                  # ダメなら id で再試行
-                  if [ -z "${TOKEN:-}" ]; then
-                    PAYLOAD2="$(jq -n \
-                      --arg user "$USERNAME" \
-                      --arg pass "$PASSWORD" \
-                      --arg tenant "$TENANT_ID" \
-                      '{
-                        auth:{
                           identity:{
-                            methods:["password"],
-                            password:{user:{id:$user,domain:{name:"default"},password:$pass}}
+                          methods:["password"],
+                          password:{user:{($key):$user,domain:{name:"default"},password:$pass}}
                           },
                           scope:{project:{id:$tenant}}
-                        }
-                      }')"
-                    : >"$H"; : >"$B"
-                    curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD2" "$ID_V3"
-                    TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
+                      }
+                      }' --arg key "$key"
+                  }
+
+                  # 1回目：user.name
+                  PAYLOAD="$(build_payload name "$USERNAME")"
+                  H=$(mktemp); B=$(mktemp)
+                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD" "$ID_V3"
+
+                  # v3: トークンはヘッダ、カタログは本文JSON
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
+
+                  # ダメなら user.id で再試行
+                  if [ -z "${TOKEN:-}" ]; then
+                  PAYLOAD="$(build_payload id "$USERNAME")"
+                  : >"$H"; : >"$B"
+                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD" "$ID_V3"
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
                   fi
 
                   if [ -z "${TOKEN:-}" ]; then
-                    echo "::error::Failed to get v3 token"
-                    echo "---- Response Headers ----"; cat "$H"
-                    echo "---- Response Body ----"; cat "$B"
-                    exit 1
+                  echo "::error::Failed to get v3 token"
+                  echo "---- Headers ----"; sed -n '1,200p' "$H"
+                  echo "---- Body (first 400) ----"; head -c 400 "$B" | tr -d '\r'; echo
+                  exit 1
                   fi
 
-                  echo "Got token (first 10 chars): ${TOKEN:0:10}********"
-                  printf 'token=%s\n' "$TOKEN" >> "$GITHUB_OUTPUT"
+                  # サービスカタログから Compute の public URL を取得（例: https://compute.c3j1.../v2.1/<project_id>）
+                  COMPUTE_URL="$(jq -r '
+                  .token.catalog[]
+                  | select(.type=="compute")
+                  | .endpoints[]
+                  | select(.interface=="public")
+                  | .url
+                  ' "$B" | head -n1)"
+
+                  if [ -z "${COMPUTE_URL:-}" ] || [ "$COMPUTE_URL" = "null" ]; then
+                  echo "::warning::No compute URL in catalog. Falling back to secrets."
+                  else
+                  echo "Catalog compute URL: $COMPUTE_URL"
+                  fi
+
+                  # 後続へ渡す
+                  echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+                  echo "compute_base=${COMPUTE_URL%/}" >> "$GITHUB_OUTPUT"
 
             - name: Probe tenant & list servers (why 404?)
               env:
@@ -122,28 +132,27 @@ jobs:
                   exit 1
                   fi
 
-            - name: Get server status (robust)
+            - name: Get server status (robust, prefer catalog URL)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
+                  COMPUTE_BASE_FROM_CATALOG: ${{ steps.auth.outputs.compute_base }}
               shell: bash
               run: |
                   set -euo pipefail
-                  # 組み上がったURLを確認（末尾スラ統一）
-                  BASE="${COMPUTE_BASE%/}"
+                  # 1) カタログにURLがあればそれを使う。無ければ従来のCOMPUTE_BASE(secrets)。
+                  BASE="${COMPUTE_BASE_FROM_CATALOG:-$COMPUTE_BASE}"
+                  BASE="${BASE%/}"
                   URL="${BASE}/servers/${SERVER_ID}"
                   echo "GET ${URL}"
 
-                  H=$(mktemp)
-                  B=$(mktemp)
+                  H=$(mktemp); B=$(mktemp)
                   CODE=$(curl -sS -w '%{http_code}' -D "$H" -o "$B" -H "X-Auth-Token: ${TOKEN}" "$URL")
-
                   echo "HTTP ${CODE}"
                   if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
                   jq -r '.server.status' "$B" | sed 's/^/Status: /'
                   else
                   echo "---- Response headers ----"; sed -n '1,200p' "$H"
                   echo "---- Response body (first 400 chars) ----"; head -c 400 "$B" | tr -d '\r'; echo
-                  echo "Hint: COMPUTE_BASE should be https://compute.c3j1.conoha.io/v2.1/<TENANT_ID>"
                   exit 1
                   fi
 
