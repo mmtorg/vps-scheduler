@@ -1,4 +1,4 @@
-name: ConoHa VPS - Stop (01:00 MMT)
+name: ConoHa VPS - Stop (00:50 MMT)
 
 on:
     schedule:
