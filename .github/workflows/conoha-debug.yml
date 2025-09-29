@@ -1,4 +1,4 @@
-name: ConoHa Debug (Auth & Status)
+name: ConoHa Debug (Auth & Auto-discover Compute Base)
 
 on:
     workflow_dispatch: {}
@@ -7,170 +7,158 @@ jobs:
     debug:
         runs-on: ubuntu-latest
         env:
-            ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens
-            COMPUTE_BASE: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }}/${{ secrets.CONOHA_TENANT_ID }}
+            ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens # 例: https://identity.c3j1.conoha.io/v3/auth/tokens
             TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
             SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
         steps:
-            - name: Install jq
+            - name: Install tools
               run: |
                   sudo apt-get update
                   sudo apt-get install -y jq
 
-            - name: Get ConoHa Token (v3, read service catalog)
+            - name: Get token & discover compute_base
               id: auth
-              shell: bash
               env:
-                  ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens # https://identity.c3j1.conoha.io/v3/auth/tokens
                   USERNAME: ${{ secrets.CONOHA_USERNAME }}
                   PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
-                  TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
-              run: |
-                  set -euo pipefail
-
-                  # リクエスト組み立て（user.name→ダメなら user.id でも再試行）
-                  build_payload() {
-                  local key="$1" val="$2"
-                  jq -n --arg user "$val" --arg pass "$PASSWORD" --arg tenant "$TENANT_ID" '
-                      {
-                      auth:{
-                          identity:{
-                          methods:["password"],
-                          password:{user:{($key):$user,domain:{name:"default"},password:$pass}}
-                          },
-                          scope:{project:{id:$tenant}}
-                      }
-                      }' --arg key "$key"
-                  }
-
-                  # 1回目：user.name
-                  PAYLOAD="$(build_payload name "$USERNAME")"
-                  H=$(mktemp); B=$(mktemp)
-                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD" "$ID_V3"
-
-                  # v3: トークンはヘッダ、カタログは本文JSON
-                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
-
-                  # ダメなら user.id で再試行
-                  if [ -z "${TOKEN:-}" ]; then
-                  PAYLOAD="$(build_payload id "$USERNAME")"
-                  : >"$H"; : >"$B"
-                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$PAYLOAD" "$ID_V3"
-                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r')"
-                  fi
-
-                  if [ -z "${TOKEN:-}" ]; then
-                  echo "::error::Failed to get v3 token"
-                  echo "---- Headers ----"; sed -n '1,200p' "$H"
-                  echo "---- Body (first 400) ----"; head -c 400 "$B" | tr -d '\r'; echo
-                  exit 1
-                  fi
-
-                  # サービスカタログから Compute の public URL を取得（例: https://compute.c3j1.../v2.1/<project_id>）
-                  COMPUTE_URL="$(jq -r '
-                  .token.catalog[]
-                  | select(.type=="compute")
-                  | .endpoints[]
-                  | select(.interface=="public")
-                  | .url
-                  ' "$B" | head -n1)"
-
-                  if [ -z "${COMPUTE_URL:-}" ] || [ "$COMPUTE_URL" = "null" ]; then
-                  echo "::warning::No compute URL in catalog. Falling back to secrets."
-                  else
-                  echo "Catalog compute URL: $COMPUTE_URL"
-                  fi
-
-                  # 後続へ渡す
-                  echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
-                  echo "compute_base=${COMPUTE_URL%/}" >> "$GITHUB_OUTPUT"
-
-            - name: Probe tenant & list servers (why 404?)
-              env:
-                  TOKEN: ${{ steps.auth.outputs.token }}
-                  shell: bash
-              run: |
-                  set -euo pipefail
-                  BASE="${COMPUTE_BASE%/}"          # 例: https://compute.c3j1.conoha.io/v2.1/<TENANT_ID>
-                  echo "COMPUTE_BASE (resolved): $BASE"
-
-                  # 1) テナントのベースURLにGET（200系が期待値）
-                  H1=$(mktemp); B1=$(mktemp)
-                  CODE1=$(curl -sS -w '%{http_code}' -D "$H1" -o "$B1" -H "X-Auth-Token: ${TOKEN}" "$BASE")
-                  echo "GET $BASE  -> HTTP $CODE1"
-                  if [ "$CODE1" -lt 200 ] || [ "$CODE1" -ge 300 ]; then
-                  echo "---- H1 ----"; sed -n '1,200p' "$H1"
-                  echo "---- B1 (first 400) ----"; head -c 400 "$B1" | tr -d '\r'; echo
-                  echo "❌ テナントのベースURLに到達できていません。TENANT_ID / エンドポイントを再確認してください。"
-                  exit 1
-                  fi
-
-                  # 2) /servers 一覧を取得してJSON確認
-                  H2=$(mktemp); B2=$(mktemp)
-                  URL_SERVERS="${BASE}/servers/detail"
-                  CODE2=$(curl -sS -w '%{http_code}' -D "$H2" -o "$B2" -H "X-Auth-Token: ${TOKEN}" "$URL_SERVERS")
-                  echo "GET $URL_SERVERS  -> HTTP $CODE2"
-                  if [ "$CODE2" -ge 200 ] && [ "$CODE2" -lt 300 ]; then
-                  # JSONかどうか軽く判定（jq失敗時は中身を表示）
-                  if jq -e '.servers' "$B2" >/dev/null 2>&1; then
-                      CNT=$(jq '.servers | length' "$B2")
-                      echo "Servers in tenant: $CNT"
-                      echo "Your SERVER_ID: ${SERVER_ID}"
-                      echo "Match (by id):"
-                      jq -r --arg id "$SERVER_ID" '.servers[] | select(.id==$id) | "\(.id)  \(.name)  \(.status)"' "$B2" || true
-                      echo "All servers (id name status):"
-                      jq -r '.servers[] | "\(.id)  \(.name)  \(.status)"' "$B2"
-                  else
-                      echo "---- servers body (first 400) ----"; head -c 400 "$B2" | tr -d '\r'; echo
-                      echo "❌ /servers がJSONで返っていません。"
-                      exit 1
-                  fi
-                  else
-                  echo "---- H2 ----"; sed -n '1,200p' "$H2"
-                  echo "---- B2 (first 400) ----"; head -c 400 "$B2" | tr -d '\r'; echo
-                  echo "❌ /servers 取得でエラー。"
-                  exit 1
-                  fi
-
-            - name: Get server status (robust, prefer catalog URL)
-              env:
-                  TOKEN: ${{ steps.auth.outputs.token }}
-                  COMPUTE_BASE_FROM_CATALOG: ${{ steps.auth.outputs.compute_base }}
+                  FALLBACK_ENDPOINT: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }} # 例: https://compute.c3j1.conoha.io/v2.1
               shell: bash
               run: |
                   set -euo pipefail
-                  # 1) カタログにURLがあればそれを使う。無ければ従来のCOMPUTE_BASE(secrets)。
-                  BASE="${COMPUTE_BASE_FROM_CATALOG:-$COMPUTE_BASE}"
-                  BASE="${BASE%/}"
-                  URL="${BASE}/servers/${SERVER_ID}"
+
+                  # ---------- v3 auth (try user.name, then user.id) ----------
+                  build_payload() {
+                    local key="$1" val="$2"
+                    jq -n --arg u "$val" --arg p "$PASSWORD" --arg t "$TENANT_ID" \
+                      '{
+                        auth:{
+                          identity:{
+                            methods:["password"],
+                            password:{user:{($key):$u,domain:{name:"default"},password:$p}}
+                          },
+                          scope:{project:{id:$t}}
+                        }
+                      }' --arg key "$key"
+                  }
+                  H=$(mktemp); B=$(mktemp)
+                  P="$(build_payload name "$USERNAME")"
+                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3"
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
+                  if [ -z "${TOKEN:-}" ]; then
+                    : >"$H"; : >"$B"
+                    P="$(build_payload id "$USERNAME")"
+                    curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3"
+                    TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
+                  fi
+                  if [ -z "${TOKEN:-}" ]; then
+                    echo "::error::Failed to get v3 token"
+                    echo "---- headers ----"; sed -n '1,160p' "$H"
+                    echo "---- body ----"; head -c 800 "$B"; echo
+                    exit 1
+                  fi
+
+                  # （デバッグ）プロジェクトIDを確認して、TENANT_IDと一致しているか表示
+                  PROJECT_ID="$(jq -r '.token.project.id // empty' "$B")"
+                  echo "Keystone project.id: ${PROJECT_ID:0:8}******** (compare with TENANT_ID: ${TENANT_ID:0:8}********)"
+
+                  # ---------- discover compute endpoint from catalog ----------
+                  CATALOG_URLS="$(jq -r '.token.catalog[] | select(.type=="compute") | .endpoints[] | select(.interface=="public") | .url' "$B" | sed 's:/*$::' || true)"
+                  if [ -z "$CATALOG_URLS" ]; then
+                    echo "::warning::No compute URL in catalog; will try FALLBACK_ENDPOINT"
+                  fi
+
+                  # 候補URLを作る（テナントIDあり/なし両方を試す）
+                  mapfile -t CANDS < <(
+                    {
+                      printf '%s\n' "$CATALOG_URLS"
+                      [ -n "${FALLBACK_ENDPOINT:-}" ] && printf '%s\n' "${FALLBACK_ENDPOINT%/}"
+                    } | awk 'NF' | sort -u
+                  )
+
+                  declare -a TESTS=()
+                  for base in "${CANDS[@]}"; do
+                    # そのまま
+                    TESTS+=("${base}")
+                    # 末尾が /v2 または /v2.1 ならテナントIDを付与したものも
+                    if [[ "$base" =~ /v2(\.1)?$ ]]; then
+                      TESTS+=("${base}/${TENANT_ID}")
+                    fi
+                  done
+
+                  # servers/detail を直接叩いて、200が返る最初のURLを採用
+                  CHOSEN=""
+                  for cb in "${TESTS[@]}"; do
+                    URL="${cb%/}/servers/detail"
+                    CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "X-Auth-Token: ${TOKEN}" "$URL" || echo 000)"
+                    echo "Probe ${URL} -> ${CODE}"
+                    if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+                      CHOSEN="${cb%/}"
+                      break
+                    fi
+                  done
+
+                  if [ -z "$CHOSEN" ]; then
+                    echo "::error::Could not find working compute_base. Probes tried above."
+                    echo "Catalog candidates:"; printf '%s\n' "${CANDS[@]}"
+                    exit 1
+                  fi
+
+                  echo "Resolved compute_base: ${CHOSEN%/}"
+                  echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+                  echo "compute_base=${CHOSEN%/}" >> "$GITHUB_OUTPUT"
+
+            - name: List servers in tenant (confirm SERVER_ID)
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+                  COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
+                  SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  BASE="${COMPUTE_BASE%/}"
+                  URL="${BASE}/servers/detail"
                   echo "GET ${URL}"
 
                   H=$(mktemp); B=$(mktemp)
                   CODE=$(curl -sS -w '%{http_code}' -D "$H" -o "$B" -H "X-Auth-Token: ${TOKEN}" "$URL")
                   echo "HTTP ${CODE}"
                   if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
-                  jq -r '.server.status' "$B" | sed 's/^/Status: /'
+                    if jq -e '.servers' "$B" >/dev/null 2>&1; then
+                      CNT=$(jq '.servers | length' "$B")
+                      echo "Servers in tenant: $CNT"
+                      echo "Your SERVER_ID: ${SERVER_ID}"
+                      echo "Match (by id):"
+                      jq -r --arg id "$SERVER_ID" '.servers[] | select(.id==$id) | "\(.id)  \(.name)  \(.status)"' "$B" || true
+                      echo "All servers (id name status):"
+                      jq -r '.servers[] | "\(.id)  \(.name)  \(.status)"' "$B"
+                    else
+                      echo "---- body (first 600) ----"; head -c 600 "$B" | tr -d '\r'; echo
+                      exit 1
+                    fi
                   else
-                  echo "---- Response headers ----"; sed -n '1,200p' "$H"
-                  echo "---- Response body (first 400 chars) ----"; head -c 400 "$B" | tr -d '\r'; echo
-                  exit 1
+                    echo "---- headers ----"; sed -n '1,200p' "$H"
+                    echo "---- body (first 600) ----"; head -c 600 "$B" | tr -d '\r'; echo
+                    exit 1
                   fi
 
-            # ▼起動・停止したいときは下をコメント解除
-            # - name: Power ON (os-start)
-            #   env:
-            #     TOKEN: ${{ steps.auth.outputs.token }}
-            #   run: |
-            #     curl -sS -X POST \
-            #       -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
-            #       -d '{"os-start": null}' \
-            #       "${COMPUTE_BASE}/servers/${SERVER_ID}/action"
-            #
-            # - name: Power OFF (os-stop)
-            #   env:
-            #     TOKEN: ${{ steps.auth.outputs.token }}
-            #   run: |
-            #     curl -sS -X POST \
-            #       -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
-            #       -d '{"os-stop": null}' \
-            #       "${COMPUTE_BASE}/servers/${SERVER_ID}/action"
+            - name: Get server status (single server)
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+                  COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
+                  SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  BASE="${COMPUTE_BASE%/}"
+                  URL="${BASE}/servers/${SERVER_ID}"
+                  echo "GET ${URL}"
+                  H=$(mktemp); B=$(mktemp)
+                  CODE=$(curl -sS -w '%{http_code}' -D "$H" -o "$B" -H "X-Auth-Token: ${TOKEN}" "$URL")
+                  echo "HTTP ${CODE}"
+                  if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+                    jq -r '.server.status' "$B" | sed 's/^/Status: /'
+                  else
+                    echo "---- headers ----"; sed -n '1,200p' "$H"
+                    echo "---- body (first 600) ----"; head -c 600 "$B" | tr -d '\r'; echo
+                    exit 1
+                  fi
