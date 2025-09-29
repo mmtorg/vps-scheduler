@@ -75,14 +75,30 @@ jobs:
                   echo "Got token (first 10 chars): ${TOKEN:0:10}********"
                   printf 'token=%s\n' "$TOKEN" >> "$GITHUB_OUTPUT"
 
-            - name: Get server status
+            - name: Get server status (robust)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
               shell: bash
               run: |
                   set -euo pipefail
-                  curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" \
-                    | jq -r '.server.status' | sed 's/^/Status: /'
+                  # 組み上がったURLを確認（末尾スラ統一）
+                  BASE="${COMPUTE_BASE%/}"
+                  URL="${BASE}/servers/${SERVER_ID}"
+                  echo "GET ${URL}"
+
+                  H=$(mktemp)
+                  B=$(mktemp)
+                  CODE=$(curl -sS -w '%{http_code}' -D "$H" -o "$B" -H "X-Auth-Token: ${TOKEN}" "$URL")
+
+                  echo "HTTP ${CODE}"
+                  if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+                  jq -r '.server.status' "$B" | sed 's/^/Status: /'
+                  else
+                  echo "---- Response headers ----"; sed -n '1,200p' "$H"
+                  echo "---- Response body (first 400 chars) ----"; head -c 400 "$B" | tr -d '\r'; echo
+                  echo "Hint: COMPUTE_BASE should be https://compute.c3j1.conoha.io/v2.1/<TENANT_ID>"
+                  exit 1
+                  fi
 
             # ▼起動・停止したいときは下をコメント解除
             # - name: Power ON (os-start)
