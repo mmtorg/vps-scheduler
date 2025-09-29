@@ -75,6 +75,53 @@ jobs:
                   echo "Got token (first 10 chars): ${TOKEN:0:10}********"
                   printf 'token=%s\n' "$TOKEN" >> "$GITHUB_OUTPUT"
 
+            - name: Probe tenant & list servers (why 404?)
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+                  shell: bash
+              run: |
+                  set -euo pipefail
+                  BASE="${COMPUTE_BASE%/}"          # 例: https://compute.c3j1.conoha.io/v2.1/<TENANT_ID>
+                  echo "COMPUTE_BASE (resolved): $BASE"
+
+                  # 1) テナントのベースURLにGET（200系が期待値）
+                  H1=$(mktemp); B1=$(mktemp)
+                  CODE1=$(curl -sS -w '%{http_code}' -D "$H1" -o "$B1" -H "X-Auth-Token: ${TOKEN}" "$BASE")
+                  echo "GET $BASE  -> HTTP $CODE1"
+                  if [ "$CODE1" -lt 200 ] || [ "$CODE1" -ge 300 ]; then
+                  echo "---- H1 ----"; sed -n '1,200p' "$H1"
+                  echo "---- B1 (first 400) ----"; head -c 400 "$B1" | tr -d '\r'; echo
+                  echo "❌ テナントのベースURLに到達できていません。TENANT_ID / エンドポイントを再確認してください。"
+                  exit 1
+                  fi
+
+                  # 2) /servers 一覧を取得してJSON確認
+                  H2=$(mktemp); B2=$(mktemp)
+                  URL_SERVERS="${BASE}/servers/detail"
+                  CODE2=$(curl -sS -w '%{http_code}' -D "$H2" -o "$B2" -H "X-Auth-Token: ${TOKEN}" "$URL_SERVERS")
+                  echo "GET $URL_SERVERS  -> HTTP $CODE2"
+                  if [ "$CODE2" -ge 200 ] && [ "$CODE2" -lt 300 ]; then
+                  # JSONかどうか軽く判定（jq失敗時は中身を表示）
+                  if jq -e '.servers' "$B2" >/dev/null 2>&1; then
+                      CNT=$(jq '.servers | length' "$B2")
+                      echo "Servers in tenant: $CNT"
+                      echo "Your SERVER_ID: ${SERVER_ID}"
+                      echo "Match (by id):"
+                      jq -r --arg id "$SERVER_ID" '.servers[] | select(.id==$id) | "\(.id)  \(.name)  \(.status)"' "$B2" || true
+                      echo "All servers (id name status):"
+                      jq -r '.servers[] | "\(.id)  \(.name)  \(.status)"' "$B2"
+                  else
+                      echo "---- servers body (first 400) ----"; head -c 400 "$B2" | tr -d '\r'; echo
+                      echo "❌ /servers がJSONで返っていません。"
+                      exit 1
+                  fi
+                  else
+                  echo "---- H2 ----"; sed -n '1,200p' "$H2"
+                  echo "---- B2 (first 400) ----"; head -c 400 "$B2" | tr -d '\r'; echo
+                  echo "❌ /servers 取得でエラー。"
+                  exit 1
+                  fi
+
             - name: Get server status (robust)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
