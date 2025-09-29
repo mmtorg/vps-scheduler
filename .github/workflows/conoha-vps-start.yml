@@ -100,17 +100,63 @@ jobs:
                     -d '{"os-start": null}' \
                     "${COMPUTE_BASE%/}/servers/${SERVER_ID}/action"
 
-            - name: Wait until ACTIVE (max ~5 min)
+            - name: Wait until ACTIVE (robust with retries)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
                   COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
                   SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
+              shell: bash
               run: |
                   set -euo pipefail
-                  for i in $(seq 1 60); do
-                    STATUS=$(curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/servers/${SERVER_ID}" | jq -r '.server.status // empty')
-                    echo "Current status: ${STATUS:-unknown}"
-                    [ "$STATUS" = "ACTIVE" ] && exit 0
-                    sleep 5
+                  BASE="${COMPUTE_BASE%/}"
+                  URL="${BASE}/servers/${SERVER_ID}"
+
+                  get_status() {
+                      # ネットワーク不調に強い取得（短いタイムアウト＋自動再試行）
+                      curl \
+                      --max-time 10 \
+                      --connect-timeout 5 \
+                      --retry 5 \
+                      --retry-delay 1 \
+                      --retry-connrefused \
+                      -sS -H "X-Auth-Token: ${TOKEN}" "$URL" 2>/dev/null \
+                      | jq -r '.server.status // empty' 2>/dev/null || true
+                  }
+
+                  # 起動直後は BUILD / VERIFYING で揺れることがあるので少し待つ
+                  sleep 5
+
+                  # 最大 10 分待機（120回×5秒）
+                  for i in $(seq 1 120); do
+                      STATUS="$(get_status)"
+                      if [ -n "$STATUS" ]; then
+                      echo "Current status: $STATUS"
+                      if [ "$STATUS" = "ACTIVE" ]; then
+                          exit 0
+                      fi
+                      else
+                      echo "Current status: (unreachable) – retrying..."
+                      fi
+                      sleep 5
                   done
+
+                  echo "Not ACTIVE yet – attempting one more os-start then waiting 60s..."
+                  # もう一度だけ os-start（冪等）
+                  curl -sS -X POST \
+                      -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
+                      -d '{"os-start": null}' \
+                      "${BASE}/servers/${SERVER_ID}/action" >/dev/null || true
+
+                  # 追加で60秒待機して最終確認
+                  for i in $(seq 1 12); do
+                      STATUS="$(get_status)"
+                      if [ -n "$STATUS" ]; then
+                      echo "Current status (final): $STATUS"
+                      [ "$STATUS" = "ACTIVE" ] && exit 0
+                      else
+                      echo "Current status (final): (unreachable) – retrying..."
+                      fi
+                      sleep 5
+                  done
+
                   echo "Timed out waiting for ACTIVE"; exit 1
