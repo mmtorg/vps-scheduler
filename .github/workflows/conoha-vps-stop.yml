@@ -2,7 +2,7 @@ name: ConoHa VPS - Stop (01:00 MMT)
 
 on:
     schedule:
-        - cron: "30 18 * * *" # 01:00 MMT
+        - cron: "20 18 * * *" # 00:50 MMT
     workflow_dispatch: {}
 
 jobs:
@@ -17,28 +17,49 @@ jobs:
             - name: Install jq
               run: sudo apt-get update && sudo apt-get install -y jq
 
-            - name: Get ConoHa Token
+            - name: Get ConoHa Token (v3)
               id: auth
+              env:
+                  ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens # 例: https://identity.c3j1.conoha.io/v3/auth/tokens
+                  USERNAME: ${{ secrets.CONOHA_USERNAME }} # APIユーザー名（gncu...形式）
+                  PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
+                  TENANT_ID: ${{ env.TENANT_ID }}
               run: |
-                  PAYLOAD=$(cat <<'JSON'
+                  set -euo pipefail
+                  read -r -d '' PAYLOAD <<'JSON'
                   {
-                    "auth": {
-                      "passwordCredentials": {
-                        "username": "__USER__",
-                        "password": "__PASS__"
+                      "auth": {
+                      "identity": {
+                          "methods": ["password"],
+                          "password": {
+                          "user": {
+                              "name": "__USER__",
+                              "domain": { "name": "default" },
+                              "password": "__PASS__"
+                          }
+                          }
                       },
-                      "tenantId": "__TENANT__"
-                    }
+                      "scope": {
+                          "project": { "id": "__TENANT__" }
+                      }
+                      }
                   }
                   JSON
-                  )
-                  PAYLOAD="${PAYLOAD/__USER__/${{ secrets.CONOHA_USERNAME }}}"
-                  PAYLOAD="${PAYLOAD/__PASS__/${{ secrets.CONOHA_PASSWORD }}}"
+                  PAYLOAD="${PAYLOAD/__USER__/${USERNAME}}"
+                  PAYLOAD="${PAYLOAD/__PASS__/${PASSWORD}}"
                   PAYLOAD="${PAYLOAD/__TENANT__/${TENANT_ID}}"
 
-                  TOKEN=$(curl -fsS -H "Content-Type: application/json" -d "${PAYLOAD}" "${ID_ENDPOINT}" | jq -r '.access.token.id')
-                  if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
-                    echo "Failed to get token"; exit 1
+                  # v3 はトークンがレスポンスヘッダ X-Subject-Token で返る
+                  # -i でヘッダ出力させて、本文と分離
+                  RESP_HEADERS=$(mktemp)
+                  RESP_BODY=$(mktemp)
+                  curl -fsS -i -H "Content-Type: application/json" -d "${PAYLOAD}" "${ID_V3}" \
+                      | awk 'BEGIN{h=1} {if(h&&$0=="") h=0; if(h) print > ENVIRON["RESP_HEADERS"]; else print > ENVIRON["RESP_BODY"]}'
+                  TOKEN=$(grep -i '^X-Subject-Token:' "$RESP_HEADERS" | awk '{print $2}' | tr -d '\r')
+
+                  if [ -z "$TOKEN" ]; then
+                      echo "Failed to get v3 token"; echo "--- headers ---"; cat "$RESP_HEADERS"; echo "--- body ---"; cat "$RESP_BODY"
+                      exit 1
                   fi
                   echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
