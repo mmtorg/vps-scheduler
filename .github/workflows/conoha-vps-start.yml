@@ -17,50 +17,89 @@ jobs:
             - name: Install jq
               run: sudo apt-get update && sudo apt-get install -y jq
 
-            - name: Get ConoHa Token (v3)
+            - name: Get ConoHa Token (v3, fixed indent)
               id: auth
+              shell: bash
               env:
                   ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens # 例: https://identity.c3j1.conoha.io/v3/auth/tokens
-                  USERNAME: ${{ secrets.CONOHA_USERNAME }} # APIユーザー名（gncu...形式）
+                  USERNAME: ${{ secrets.CONOHA_USERNAME }} # APIユーザー名（gncu...）
                   PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
                   TENANT_ID: ${{ env.TENANT_ID }}
               run: |
                   set -euo pipefail
+
+                  # 1回目: user.name で試す
                   read -r -d '' PAYLOAD <<'JSON'
                   {
-                    "auth": {
+                  "auth": {
                       "identity": {
-                        "methods": ["password"],
-                        "password": {
+                      "methods": ["password"],
+                      "password": {
                           "user": {
-                            "name": "__USER__",
-                            "domain": { "name": "default" },
-                            "password": "__PASS__"
+                          "name": "__USER__",
+                          "domain": { "name": "default" },
+                          "password": "__PASS__"
                           }
-                        }
-                      },
-                      "scope": {
-                        "project": { "id": "__TENANT__" }
                       }
-                    }
+                      },
+                      "scope": { "project": { "id": "__TENANT__" } }
+                  }
                   }
                   JSON
                   PAYLOAD="${PAYLOAD/__USER__/${USERNAME}}"
                   PAYLOAD="${PAYLOAD/__PASS__/${PASSWORD}}"
                   PAYLOAD="${PAYLOAD/__TENANT__/${TENANT_ID}}"
 
-                  # v3 はトークンがレスポンスヘッダ X-Subject-Token で返る
-                  # -i でヘッダ出力させて、本文と分離
-                  RESP_HEADERS=$(mktemp)
-                  RESP_BODY=$(mktemp)
-                  curl -fsS -i -H "Content-Type: application/json" -d "${PAYLOAD}" "${ID_V3}" \
-                    | awk 'BEGIN{h=1} {if(h&&$0=="") h=0; if(h) print > ENVIRON["RESP_HEADERS"]; else print > ENVIRON["RESP_BODY"]}'
-                  TOKEN=$(grep -i '^X-Subject-Token:' "$RESP_HEADERS" | awk '{print $2}' | tr -d '\r')
+                  RESP_HEADERS="$(mktemp)"
+                  RESP_BODY="$(mktemp)"
+                  # -Dでヘッダをファイルへ、-oで本文をファイルへ（パイプを使わないのでインデント事故なし）
+                  curl -sS -D "$RESP_HEADERS" -o "$RESP_BODY" \
+                  -H "Content-Type: application/json" \
+                  -d "$PAYLOAD" \
+                  "$ID_V3"
+
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$RESP_HEADERS" | tr -d '\r')"
+
+                  # 失敗時: user.id でリトライ（環境によっては name では通らない）
+                  if [ -z "$TOKEN" ]; then
+                  read -r -d '' PAYLOAD2 <<'JSON'
+                  {
+                      "auth": {
+                      "identity": {
+                          "methods": ["password"],
+                          "password": {
+                          "user": {
+                              "id": "__USER_ID__",
+                              "domain": { "name": "default" },
+                              "password": "__PASS__"
+                          }
+                          }
+                      },
+                      "scope": { "project": { "id": "__TENANT__" } }
+                      }
+                  }
+                  JSON
+                  PAYLOAD2="${PAYLOAD2/__USER_ID__/${USERNAME}}"
+                  PAYLOAD2="${PAYLOAD2/__PASS__/${PASSWORD}}"
+                  PAYLOAD2="${PAYLOAD2/__TENANT__/${TENANT_ID}}"
+
+                  : >"$RESP_HEADERS"; : >"$RESP_BODY"
+                  curl -sS -D "$RESP_HEADERS" -o "$RESP_BODY" \
+                      -H "Content-Type: application/json" \
+                      -d "$PAYLOAD2" \
+                      "$ID_V3"
+
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$RESP_HEADERS" | tr -d '\r')"
+                  fi
 
                   if [ -z "$TOKEN" ]; then
-                    echo "Failed to get v3 token"; echo "--- headers ---"; cat "$RESP_HEADERS"; echo "--- body ---"; cat "$RESP_BODY"
-                    exit 1
+                  echo "Failed to get v3 token"
+                  echo "---- Request URL: $ID_V3"
+                  echo "---- Response Headers ----"; cat "$RESP_HEADERS"
+                  echo "---- Response Body ----"; cat "$RESP_BODY"
+                  exit 1
                   fi
+
                   echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
             - name: Power ON (os-start)
