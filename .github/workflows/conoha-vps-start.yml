@@ -2,130 +2,115 @@ name: ConoHa VPS - Start (22:50 MMT)
 
 on:
     schedule:
-        - cron: "20 16 * * *" # 22:50 MMT
+        - cron: "20 16 * * *" # 22:50 MMT (UTC+6:30)
     workflow_dispatch: {}
 
 jobs:
     start:
         runs-on: ubuntu-latest
-        env:
-            ID_ENDPOINT: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/v2.0/tokens
-            COMPUTE_BASE: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }}/${{ secrets.CONOHA_TENANT_ID }}
-            TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
-            SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
-        steps:
-            - name: Install jq
-              run: sudo apt-get update && sudo apt-get install -y jq
+        concurrency:
+            group: conoha-vps-power
+            cancel-in-progress: false
 
-            - name: Get ConoHa Token (v3, fixed indent)
+        steps:
+            - name: Install tools
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y jq
+
+            - name: Get token & discover compute_base (Keystone v3)
               id: auth
               shell: bash
               env:
-                  ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens # 例: https://identity.c3j1.conoha.io/v3/auth/tokens
-                  USERNAME: ${{ secrets.CONOHA_USERNAME }} # APIユーザー名（gncu...）
+                  ID_V3: ${{ secrets.CONOHA_IDENTITY_ENDPOINT }}/auth/tokens
+                  USERNAME: ${{ secrets.CONOHA_USERNAME }}
                   PASSWORD: ${{ secrets.CONOHA_PASSWORD }}
-                  TENANT_ID: ${{ env.TENANT_ID }}
+                  TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
+                  FALLBACK_ENDPOINT: ${{ secrets.CONOHA_COMPUTE_ENDPOINT }} # e.g. https://compute.c3j1.conoha.io/v2.1
               run: |
                   set -euo pipefail
 
-                  # 1回目: user.name で試す
-                  read -r -d '' PAYLOAD <<'JSON'
-                  {
-                  "auth": {
-                      "identity": {
-                      "methods": ["password"],
-                      "password": {
-                          "user": {
-                          "name": "__USER__",
-                          "domain": { "name": "default" },
-                          "password": "__PASS__"
-                          }
-                      }
-                      },
-                      "scope": { "project": { "id": "__TENANT__" } }
+                  build_payload() {
+                    local key="$1" val="$2"
+                    jq -n --arg u "$val" --arg p "$PASSWORD" --arg t "$TENANT_ID" \
+                      '{
+                        auth:{
+                          identity:{
+                            methods:["password"],
+                            password:{user:{($key):$u,domain:{name:"default"},password:$p}}
+                          },
+                          scope:{project:{id:$t}}
+                        }
+                      }' --arg key "$key"
                   }
-                  }
-                  JSON
-                  PAYLOAD="${PAYLOAD/__USER__/${USERNAME}}"
-                  PAYLOAD="${PAYLOAD/__PASS__/${PASSWORD}}"
-                  PAYLOAD="${PAYLOAD/__TENANT__/${TENANT_ID}}"
 
-                  RESP_HEADERS="$(mktemp)"
-                  RESP_BODY="$(mktemp)"
-                  # -Dでヘッダをファイルへ、-oで本文をファイルへ（パイプを使わないのでインデント事故なし）
-                  curl -sS -D "$RESP_HEADERS" -o "$RESP_BODY" \
-                  -H "Content-Type: application/json" \
-                  -d "$PAYLOAD" \
-                  "$ID_V3"
-
-                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$RESP_HEADERS" | tr -d '\r')"
-
-                  # 失敗時: user.id でリトライ（環境によっては name では通らない）
-                  if [ -z "$TOKEN" ]; then
-                  read -r -d '' PAYLOAD2 <<'JSON'
-                  {
-                      "auth": {
-                      "identity": {
-                          "methods": ["password"],
-                          "password": {
-                          "user": {
-                              "id": "__USER_ID__",
-                              "domain": { "name": "default" },
-                              "password": "__PASS__"
-                          }
-                          }
-                      },
-                      "scope": { "project": { "id": "__TENANT__" } }
-                      }
-                  }
-                  JSON
-                  PAYLOAD2="${PAYLOAD2/__USER_ID__/${USERNAME}}"
-                  PAYLOAD2="${PAYLOAD2/__PASS__/${PASSWORD}}"
-                  PAYLOAD2="${PAYLOAD2/__TENANT__/${TENANT_ID}}"
-
-                  : >"$RESP_HEADERS"; : >"$RESP_BODY"
-                  curl -sS -D "$RESP_HEADERS" -o "$RESP_BODY" \
-                      -H "Content-Type: application/json" \
-                      -d "$PAYLOAD2" \
-                      "$ID_V3"
-
-                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$RESP_HEADERS" | tr -d '\r')"
+                  # Try user.name then user.id
+                  H=$(mktemp); B=$(mktemp)
+                  P="$(build_payload name "$USERNAME")"
+                  curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3"
+                  TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
+                  if [ -z "${TOKEN:-}" ]; then
+                    : >"$H"; : >"$B"
+                    P="$(build_payload id "$USERNAME")"
+                    curl -sS -D "$H" -o "$B" -H "Content-Type: application/json" -d "$P" "$ID_V3"
+                    TOKEN="$(awk -F': *' 'tolower($1)=="x-subject-token"{print $2}' "$H" | tr -d '\r' || true)"
                   fi
+                  test -n "${TOKEN:-}" || { echo "::error::Failed to get v3 token"; exit 1; }
 
-                  if [ -z "$TOKEN" ]; then
-                  echo "Failed to get v3 token"
-                  echo "---- Request URL: $ID_V3"
-                  echo "---- Response Headers ----"; cat "$RESP_HEADERS"
-                  echo "---- Response Body ----"; cat "$RESP_BODY"
-                  exit 1
-                  fi
+                  # Discover compute endpoint from service catalog
+                  CATALOG_URLS="$(jq -r '.token.catalog[] | select(.type=="compute") | .endpoints[] | select(.interface=="public") | .url' "$B" | sed 's:/*$::' || true)"
+                  mapfile -t CANDS < <(
+                    {
+                      printf '%s\n' "$CATALOG_URLS"
+                      [ -n "${FALLBACK_ENDPOINT:-}" ] && printf '%s\n' "${FALLBACK_ENDPOINT%/}"
+                    } | awk 'NF' | sort -u
+                  )
+
+                  declare -a TESTS=()
+                  for base in "${CANDS[@]}"; do
+                    TESTS+=("${base}")
+                    if [[ "$base" =~ /v2(\.1)?$ ]]; then
+                      TESTS+=("${base}/${TENANT_ID}")
+                    fi
+                  done
+
+                  CHOSEN=""
+                  for cb in "${TESTS[@]}"; do
+                    URL="${cb%/}/servers/detail"
+                    CODE="$(curl -sS -o /dev/null -w '%{http_code}' -H "X-Auth-Token: ${TOKEN}" "$URL" || echo 000)"
+                    if [ "$CODE" -ge 200 ] && [ "$CODE" -lt 300 ]; then
+                      CHOSEN="${cb%/}"
+                      break
+                    fi
+                  done
+                  test -n "$CHOSEN" || { echo "::error::No working compute endpoint found"; exit 1; }
 
                   echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+                  echo "compute_base=$CHOSEN" >> "$GITHUB_OUTPUT"
 
             - name: Power ON (os-start)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
+                  COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
+                  SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
               run: |
-                  curl -fsS -X POST \
+                  set -euo pipefail
+                  curl -sS -X POST \
                     -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
                     -d '{"os-start": null}' \
-                    "${COMPUTE_BASE}/servers/${SERVER_ID}/action"
+                    "${COMPUTE_BASE%/}/servers/${SERVER_ID}/action"
 
-            - name: Wait until ACTIVE (optional)
+            - name: Wait until ACTIVE (max ~5 min)
               env:
                   TOKEN: ${{ steps.auth.outputs.token }}
+                  COMPUTE_BASE: ${{ steps.auth.outputs.compute_base }}
+                  SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
               run: |
-                  for i in $(seq 1 30); do
-                    STATUS=$(curl -fsS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" | jq -r '.server.status')
-                    echo "Current status: $STATUS"
+                  set -euo pipefail
+                  for i in $(seq 1 60); do
+                    STATUS=$(curl -sS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE%/}/servers/${SERVER_ID}" | jq -r '.server.status // empty')
+                    echo "Current status: ${STATUS:-unknown}"
                     [ "$STATUS" = "ACTIVE" ] && exit 0
-                    sleep 10
+                    sleep 5
                   done
                   echo "Timed out waiting for ACTIVE"; exit 1
-
-            - name: Show fixed IP (for your check)
-              env:
-                  TOKEN: ${{ steps.auth.outputs.token }}
-              run: |
-                  curl -fsS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" \
-                    | jq -r '.server.addresses | to_entries[] | "\(.key): " + ( .value | map(.addr) | join(", ") )'
