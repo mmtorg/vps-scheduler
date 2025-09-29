@@ -1,0 +1,65 @@
+name: ConoHa VPS - Stop (01:00 MMT)
+
+on:
+    schedule:
+        # 18:30 UTC 毎日＝MMT(UTC+6:30) で翌日 01:00
+        - cron: "30 18 * * *"
+    workflow_dispatch: {}
+
+jobs:
+    stop:
+        runs-on: ubuntu-latest
+        env:
+            CONOHA_REGION: ${{ secrets.CONOHA_REGION || 'tyo1' }}
+            TENANT_ID: ${{ secrets.CONOHA_TENANT_ID }}
+            SERVER_ID: ${{ secrets.CONOHA_SERVER_ID }}
+        steps:
+            - name: Install jq
+              run: sudo apt-get update && sudo apt-get install -y jq
+
+            - name: Get ConoHa Token
+              id: auth
+              run: |
+                  ID_ENDPOINT="https://identity.${CONOHA_REGION}.conoha.io/v2.0/tokens"
+                  PAYLOAD=$(cat <<'JSON'
+                  {
+                    "auth": {
+                      "passwordCredentials": {
+                        "username": "__USER__",
+                        "password": "__PASS__"
+                      },
+                      "tenantId": "__TENANT__"
+                    }
+                  }
+                  JSON
+                  )
+                  PAYLOAD="${PAYLOAD/__USER__/${{ secrets.CONOHA_USERNAME }}}"
+                  PAYLOAD="${PAYLOAD/__PASS__/${{ secrets.CONOHA_PASSWORD }}}"
+                  PAYLOAD="${PAYLOAD/__TENANT__/${TENANT_ID}}"
+
+                  TOKEN=$(curl -fsS -H "Content-Type: application/json" -d "${PAYLOAD}" "${ID_ENDPOINT}" | jq -r '.access.token.id')
+                  if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+                    echo "Failed to get token"; exit 1
+                  fi
+                  echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+            - name: Graceful shutdown (os-stop)
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+              run: |
+                  COMPUTE="https://compute.${CONOHA_REGION}.conoha.io/v2/${TENANT_ID}/servers/${SERVER_ID}/action"
+                  curl -fsS -X POST -H "X-Auth-Token: ${TOKEN}" -H "Content-Type: application/json" \
+                    -d '{"os-stop": null}' "${COMPUTE}"
+
+            - name: Wait until SHUTOFF (optional)
+              env:
+                  TOKEN: ${{ steps.auth.outputs.token }}
+              run: |
+                  COMPUTE_BASE="https://compute.${CONOHA_REGION}.conoha.io/v2/${TENANT_ID}"
+                  for i in $(seq 1 30); do
+                    STATUS=$(curl -fsS -H "X-Auth-Token: ${TOKEN}" "${COMPUTE_BASE}/servers/${SERVER_ID}" | jq -r '.server.status')
+                    echo "Current status: $STATUS"
+                    [ "$STATUS" = "SHUTOFF" ] && exit 0
+                    sleep 10
+                  done
+                  echo "Timed out waiting for SHUTOFF"; exit 1
